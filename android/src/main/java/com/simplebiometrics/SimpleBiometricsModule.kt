@@ -69,7 +69,11 @@ class SimpleBiometricsModule(reactContext: ReactApplicationContext) :
           object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
               super.onAuthenticationError(errorCode, errString)
-              promise!!.reject(java.lang.Exception(errString.toString()))
+              if(errorCode == BiometricPrompt.ERROR_CANCLED) {
+                promise!!.reject("BIOMETRIC_SYSTEM_CANCELED", errString.toString())
+              } else {
+                promise!!.reject(java.lang.Exception(errString.toString()))
+              }
             }
 
             override fun onAuthenticationSucceeded(
@@ -80,7 +84,7 @@ class SimpleBiometricsModule(reactContext: ReactApplicationContext) :
             }
           }
 
-        if (activity != null) {
+        if (activity != null && !activity.isFinishing && !(activity as FragmentActivity).isDestroyed) {
           val prompt = BiometricPrompt(
             activity as FragmentActivity, mainExecutor,
             authenticationCallback
