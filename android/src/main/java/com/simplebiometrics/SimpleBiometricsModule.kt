@@ -4,6 +4,8 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import com.facebook.react.bridge.LifecycleEventListener
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.UiThreadUtil.runOnUiThread
@@ -12,7 +14,21 @@ import com.facebook.react.module.annotations.ReactModule
 
 @ReactModule(name = SimpleBiometricsModule.NAME)
 class SimpleBiometricsModule(reactContext: ReactApplicationContext) :
-  NativeSimpleBiometricsSpec(reactContext) {
+  NativeSimpleBiometricsSpec(reactContext), LifecycleEventListener {
+
+  data class PendingAuthRequest(
+    val promptTitle: String?,
+    val promptMessage: String?,
+    val allowDeviceCredentials: Boolean,
+    val promise: Promise
+  )
+
+  private var pendingAuthRequest: PendingAuthRequest? = null
+  private var launchAttemptScheduled = false
+
+  init {
+    reactContext.addLifecycleEventListener(this)
+  }
 
   override fun getName(): String {
     return NAME
@@ -20,6 +36,25 @@ class SimpleBiometricsModule(reactContext: ReactApplicationContext) :
 
   companion object {
     const val NAME = "SimpleBiometrics"
+  }
+
+  override fun onHostResume() {
+    launchPendingAuthentication()
+  }
+
+  override fun onHostPause() {
+    // No-op; pending auth remains queued until host resumes.
+  }
+
+  override fun onHostDestroy() {
+    // No-op; pending auth remains queued until activity is available again.
+  }
+
+  override fun invalidate() {
+    reactApplicationContext.removeLifecycleEventListener(this)
+    pendingAuthRequest = null
+    launchAttemptScheduled = false
+    super.invalidate()
   }
 
   /**
@@ -61,18 +96,60 @@ class SimpleBiometricsModule(reactContext: ReactApplicationContext) :
     promise: Promise?
   ) {
     runOnUiThread {
+      if (promise == null) {
+        return@runOnUiThread
+      }
+
+      if (pendingAuthRequest != null) {
+        promise.reject("BIOMETRIC_IN_PROGRESS", "Another biometric authentication request is already in progress")
+        return@runOnUiThread
+      }
+
+      pendingAuthRequest = PendingAuthRequest(
+        promptTitle = promptTitle,
+        promptMessage = promptMessage,
+        allowDeviceCredentials = allowDeviceCredentials,
+        promise = promise
+      )
+
+      launchPendingAuthentication()
+    }
+  }
+
+  private fun launchPendingAuthentication() {
+    runOnUiThread {
+      val request = pendingAuthRequest ?: return@runOnUiThread
+      val activity = reactApplicationContext.currentActivity as? FragmentActivity ?: return@runOnUiThread
+
+      if (activity.isFinishing || activity.isDestroyed) {
+        return@runOnUiThread
+      }
+
+      if (!activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+        if (!launchAttemptScheduled) {
+          launchAttemptScheduled = true
+          activity.window?.decorView?.post {
+            launchAttemptScheduled = false
+            launchPendingAuthentication()
+          } ?: run {
+            launchAttemptScheduled = false
+          }
+        }
+        return@runOnUiThread
+      }
+
       try {
         val context = reactApplicationContext
-        val activity = this.reactApplicationContext.currentActivity
         val mainExecutor = ContextCompat.getMainExecutor(context)
         val authenticationCallback: BiometricPrompt.AuthenticationCallback =
           object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
               super.onAuthenticationError(errorCode, errString)
-              if(errorCode == BiometricPrompt.ERROR_CANCELED) {
-                promise!!.reject("BIOMETRIC_SYSTEM_CANCELED", errString.toString())
+              pendingAuthRequest = null
+              if (errorCode == BiometricPrompt.ERROR_CANCELED) {
+                request.promise.reject("BIOMETRIC_SYSTEM_CANCELED", errString.toString())
               } else {
-                promise!!.reject(java.lang.Exception(errString.toString()))
+                request.promise.reject(java.lang.Exception(errString.toString()))
               }
             }
 
@@ -80,29 +157,28 @@ class SimpleBiometricsModule(reactContext: ReactApplicationContext) :
               result: BiometricPrompt.AuthenticationResult
             ) {
               super.onAuthenticationSucceeded(result)
-              promise!!.resolve(true)
+              pendingAuthRequest = null
+              request.promise.resolve(true)
             }
           }
 
-        if (activity != null && !activity.isFinishing && !(activity as FragmentActivity).isDestroyed) {
-          val prompt = BiometricPrompt(
-            activity as FragmentActivity, mainExecutor,
-            authenticationCallback
-          )
+        val prompt = BiometricPrompt(
+          activity,
+          mainExecutor,
+          authenticationCallback
+        )
 
-          val authenticators = getAllowedAuthenticators(allowDeviceCredentials)
-          val promptInfo: BiometricPrompt.PromptInfo = BiometricPrompt.PromptInfo.Builder()
-            .setAllowedAuthenticators(authenticators)
-            .setTitle(promptTitle ?: "")
-            .setSubtitle(promptMessage)
-            .build()
+        val authenticators = getAllowedAuthenticators(request.allowDeviceCredentials)
+        val promptInfo: BiometricPrompt.PromptInfo = BiometricPrompt.PromptInfo.Builder()
+          .setAllowedAuthenticators(authenticators)
+          .setTitle(request.promptTitle ?: "")
+          .setSubtitle(request.promptMessage)
+          .build()
 
-          prompt.authenticate(promptInfo)
-        } else {
-          throw java.lang.Exception("null activity")
-        }
+        prompt.authenticate(promptInfo)
       } catch (e: java.lang.Exception) {
-        promise!!.reject(e)
+        pendingAuthRequest = null
+        request.promise.reject(e)
       }
     }
   }
